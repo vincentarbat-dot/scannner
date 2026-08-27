@@ -23,6 +23,9 @@ export interface RecognizedItem {
   unit?: string
   price?: number
   amount?: number
+  confidence?: number
+  needsReview?: boolean
+  source?: string[]
 }
 
 export interface InvoiceDocument {
