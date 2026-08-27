@@ -31,11 +31,12 @@ npm run dev
    кроме: настройки автостатуса в `/admin` и смены роли других пользователей
    там же (остальной функционал Части 4 — архив/поиск/офлайн-очередь/
    «Улучшить документ» — не зависит от этой миграции).
-4. **Project Settings → API** → скопировать `Project URL` и `anon public key`
+4. **SQL Editor → New query** → вставить содержимое [`supabase/migrations/002_ocr.sql`](./supabase/migrations/002_ocr.sql) → Run. Это минимально добавляет поля OCR к существующей таблице `documents`; `schema.sql` заново менять не нужно.
+6. **Project Settings → API** → скопировать `Project URL` и `anon public key`
    в `.env` (см. `.env.example`).
-5. **Authentication → Providers** → Email включён по умолчанию, этого
+7. **Authentication → Providers** → Email включён по умолчанию, этого
    достаточно для MVP.
-6. Назначить себе роль `admin`, чтобы попасть в `/admin`: **Table Editor →
+8. Назначить себе роль `admin`, чтобы попасть в `/admin`: **Table Editor →
    profiles** → найти свою строку по email/`id` → изменить `role` на
    `admin` вручную (первого администратора иначе назначить неоткуда —
    дальше можно управлять ролями других пользователей уже из `/admin`).
@@ -80,7 +81,8 @@ src/
   types/          # TS-типы, соответствуют таблицам БД
 supabase/
   schema.sql              # полная схема БД на весь проект (все части)
-  migrations/002_part4.sql # доп. таблицы/политики Части 4 (см. п.3 выше)
+  migrations/002_part4.sql # доп. таблицы/политики Части 4
+  migrations/002_ocr.sql    # поля OCR Части 5
 PROGRESS.md        # статус разработки по частям — читать при продолжении
 netlify.toml        # конфиг деплоя
 ```

@@ -21,6 +21,8 @@ import { detectCodes, dataUrlToCanvas, type CodeDetection } from './codes'
 import { scoreDocumentOverall } from './imageQuality'
 import { buildDocumentPdf } from './pdf'
 import { getAutoStatusSetting } from './settings'
+import { recognizeInvoice } from './ocr'
+import { parseInvoice } from './invoiceParser'
 import type { CapturedPage } from '../components/scan/types'
 import type { DocumentStatus } from '../types'
 
@@ -29,6 +31,7 @@ export type SaveStep =
   | 'processing'
   | 'uploading'
   | 'codes'
+  | 'ocr'
   | 'pdf'
   | 'finalizing'
 
@@ -82,6 +85,8 @@ export async function saveScannedDocument(
     let hasBarcode = false
     let hasUnreadableCode = false
     const processedBlobs: Blob[] = []
+    const ocrPages: Array<Record<string, unknown>> = []
+    const parsedPages: ReturnType<typeof parseInvoice>[] = []
 
     for (let i = 0; i < pages.length; i++) {
       const page = pages[i]
@@ -148,6 +153,21 @@ export async function saveScannedDocument(
         )
       }
 
+      // Part 5: OCR runs on the already processed image. PaddleOCR.js uses
+      // its own Web Worker, so inference does not occupy the React/UI thread.
+      onProgress?.({ step: 'ocr', pageIndex: i, pageCount: pages.length })
+      const ocr = await recognizeInvoice(processed.blob)
+      const parsed = parseInvoice(ocr.items)
+      parsedPages.push(parsed)
+      ocrPages.push({
+        page_number: pageNumber,
+        items: ocr.items,
+        width: ocr.width,
+        height: ocr.height,
+        metrics: ocr.metrics,
+        raw_text: parsed.rawText,
+      })
+
       pageScores.push(page.score)
     }
 
@@ -157,6 +177,27 @@ export async function saveScannedDocument(
     await uploadBlob(BUCKETS.pdfs, pdfPath, pdfBlob)
 
     onProgress?.({ step: 'finalizing', pageCount: pages.length })
+    const mergedItems = parsedPages.flatMap((p) => p.items)
+    const best = <T,>(values: Array<{ value: T; confidence: number }>): { value: T; confidence: number } =>
+      values.filter((v) => v.value !== '' && v.value !== 0).sort((a, b) => b.confidence - a.confidence)[0] ?? { value: '' as T, confidence: 0 }
+    const supplier = best(parsedPages.map((p) => p.supplier_name))
+    const supplierBin = best(parsedPages.map((p) => p.supplier_bin))
+    const supplierIin = best(parsedPages.map((p) => p.supplier_iin))
+    const invoiceNumber = best(parsedPages.map((p) => p.invoice_number))
+    const invoiceDate = best(parsedPages.map((p) => p.invoice_date))
+    const documentNumber = best(parsedPages.map((p) => p.document_number))
+    const total = best(parsedPages.map((p) => p.total_amount))
+    const vat = best(parsedPages.map((p) => p.vat_amount))
+    const bank = best(parsedPages.map((p) => p.bank_details))
+    const ocrResult = {
+      version: 1,
+      engine: 'PaddleOCR.js',
+      ocr_version: 'PP-OCRv5',
+      pages: ocrPages,
+      parsed: { supplier_name: supplier, supplier_bin: supplierBin, supplier_iin: supplierIin, invoice_number: invoiceNumber, invoice_date: invoiceDate, document_number: documentNumber, bank_details: bank, total_amount: total, vat_amount: vat },
+      completed_at: new Date().toISOString(),
+    }
+
     const quality = scoreDocumentOverall({ pageScores, hasUnreadableCode })
 
     // Раздел 18 ТЗ: статус может меняться автоматически "в зависимости от
@@ -183,6 +224,18 @@ export async function saveScannedDocument(
         pdf_path: pdfPath,
         upload_status: 'uploaded',
         status,
+        supplier_name: supplier.value || null,
+        supplier_bin: supplierBin.value || null,
+        supplier_iin: supplierIin.value || null,
+        invoice_number: invoiceNumber.value || documentNumber.value || null,
+        document_number: documentNumber.value || null,
+        invoice_date: invoiceDate.value || null,
+        total_amount: total.value || null,
+        vat_amount: vat.value || null,
+        bank_details: Object.keys(bank.value ?? {}).length ? { raw: Object.values(bank.value).join('\n'), parsed: bank.value } : null,
+        recognized_items: mergedItems.length ? mergedItems : null,
+        ocr_result: ocrResult,
+        ocr_completed_at: ocrResult.completed_at,
       })
       .eq('id', documentId)
 

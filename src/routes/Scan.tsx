@@ -37,6 +37,7 @@ const STEP_LABELS: Record<SaveProgress['step'], string> = {
   creating: 'Создаём документ…',
   processing: 'Обрабатываем страницы…',
   codes: 'Проверяем QR-коды и штрихкоды…',
+  ocr: 'Распознаём текст накладной…',
   uploading: 'Загружаем в облако…',
   pdf: 'Формируем PDF…',
   finalizing: 'Завершаем сохранение…',

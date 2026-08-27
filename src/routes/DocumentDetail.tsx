@@ -1,11 +1,7 @@
 // Карточка накладной — раздел 15 ТЗ, Часть 3.
 //
-// OCR ещё не подключён (см. PROGRESS.md — движок выбирается в Части 5,
-// решение в пользу PaddleOCR принято, но реализация отложена). Поэтому
-// все поля здесь заполняются и правятся ВРУЧНУЮ — раздел 13 ТЗ и так
-// требует возможности ручной коррекции распознанных данных, так что
-// форма ниже уже является тем самым UI и переиспользуется, когда в
-// Части 5 появится автозаполнение (поля просто будут предзаполнены).
+// Часть 5: OCR заполняет эту же форму; ручное исправление пользователя является источником истины.
+
 
 import { useCallback, useEffect, useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
@@ -30,6 +26,14 @@ interface PageWithUrls extends DocumentPage {
 }
 
 const STATUS_OPTIONS: DocumentStatus[] = ['new', 'reviewed', 'sent_to_accounting', 'processed', 'archived']
+
+function OcrConfidence({ doc, field }: { doc: InvoiceDocument; field: string }) {
+  const parsed = doc.ocr_result && typeof doc.ocr_result === 'object' ? (doc.ocr_result as { parsed?: Record<string, { confidence?: number; needsReview?: boolean }> }).parsed : undefined
+  const confidence = parsed?.[field]?.confidence
+  if (confidence == null) return null
+  const low = parsed?.[field]?.needsReview || confidence < 0.75
+  return <span className={low ? 'ml-2 text-xs text-[var(--color-danger)]' : 'ml-2 text-xs text-[var(--color-ok)]'}>{low ? '⚠ проверить OCR' : `OCR ${Math.round(confidence * 100)}%`}</span>
+}
 
 function emptyItem(): RecognizedItem {
   return { name: '', quantity: undefined, unit: '', price: undefined, amount: undefined }
@@ -57,7 +61,9 @@ export default function DocumentDetail() {
   const [form, setForm] = useState({
     supplier_name: '',
     supplier_bin: '',
+    supplier_iin: '',
     invoice_number: '',
+    document_number: '',
     invoice_date: '',
     total_amount: '',
     vat_amount: '',
@@ -87,7 +93,9 @@ export default function DocumentDetail() {
     setForm({
       supplier_name: document.supplier_name ?? '',
       supplier_bin: document.supplier_bin ?? '',
+      supplier_iin: document.supplier_iin ?? '',
       invoice_number: document.invoice_number ?? '',
+      document_number: document.document_number ?? '',
       invoice_date: document.invoice_date ?? '',
       total_amount: document.total_amount != null ? String(document.total_amount) : '',
       vat_amount: document.vat_amount != null ? String(document.vat_amount) : '',
@@ -137,7 +145,9 @@ export default function DocumentDetail() {
       .update({
         supplier_name: form.supplier_name || null,
         supplier_bin: form.supplier_bin || null,
+        supplier_iin: form.supplier_iin || null,
         invoice_number: form.invoice_number || null,
+        document_number: form.document_number || null,
         invoice_date: form.invoice_date || null,
         total_amount: form.total_amount ? Number(form.total_amount) : null,
         vat_amount: form.vat_amount ? Number(form.vat_amount) : null,
@@ -274,6 +284,13 @@ export default function DocumentDetail() {
       </div>
 
       {/* Раздел 20 ТЗ: два варианта каждой страницы */}
+      {doc.ocr_result && (
+        <div className="mt-4 rounded-xl border border-[var(--color-line)] bg-[var(--color-paper-raised)] p-3">
+          <p className="text-sm font-medium text-[var(--color-ink)]">OCR: PaddleOCR.js · PP-OCRv5</p>
+          <p className="mt-1 text-xs text-[var(--color-ink-soft)]">Результат сохранён для проверки. Значения с низкой уверенностью отмечены ⚠.</p>
+        </div>
+      )}
+
       <h2 className="font-display mt-6 text-lg text-[var(--color-ink)]">Страницы</h2>
       <div className="mt-2 space-y-3">
         {pages.map((p) => (
@@ -403,12 +420,12 @@ export default function DocumentDetail() {
       {/* Раздел 13, 15 ТЗ: распознанные / вводимые вручную поля */}
       <h2 className="font-display mt-6 text-lg text-[var(--color-ink)]">Данные накладной</h2>
       <p className="mt-1 text-xs text-[var(--color-ink-soft)]">
-        Автоматическое распознавание (OCR) — Часть 5. Пока заполняется и правится вручную.
+        PaddleOCR автоматически заполняет поля. Проверьте значения с ⚠ перед сохранением — ручная правка пользователя имеет приоритет.
       </p>
 
       <div className="mt-3 space-y-3">
         <label className="block">
-          <span className="text-xs text-[var(--color-ink-soft)]">Поставщик</span>
+          <span className="text-xs text-[var(--color-ink-soft)]">Поставщик<OcrConfidence doc={doc} field="supplier_name" /></span>
           <input
             className="input mt-1"
             value={form.supplier_name}
@@ -416,16 +433,24 @@ export default function DocumentDetail() {
           />
         </label>
         <label className="block">
-          <span className="text-xs text-[var(--color-ink-soft)]">БИН</span>
+          <span className="text-xs text-[var(--color-ink-soft)]">БИН<OcrConfidence doc={doc} field="supplier_bin" /></span>
           <input
             className="input mt-1 font-mono-data"
             value={form.supplier_bin}
             onChange={(e) => setForm((f) => ({ ...f, supplier_bin: e.target.value }))}
           />
         </label>
+        <label className="block">
+          <span className="text-xs text-[var(--color-ink-soft)]">ИИН<OcrConfidence doc={doc} field="supplier_iin" /></span>
+          <input
+            className="input mt-1 font-mono-data"
+            value={form.supplier_iin}
+            onChange={(e) => setForm((f) => ({ ...f, supplier_iin: e.target.value }))}
+          />
+        </label>
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Номер накладной</span>
+            <span className="text-xs text-[var(--color-ink-soft)]">Номер накладной<OcrConfidence doc={doc} field="invoice_number" /></span>
             <input
               className="input mt-1 font-mono-data"
               value={form.invoice_number}
@@ -433,7 +458,15 @@ export default function DocumentDetail() {
             />
           </label>
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Дата</span>
+            <span className="text-xs text-[var(--color-ink-soft)]">Номер документа<OcrConfidence doc={doc} field="document_number" /></span>
+            <input
+              className="input mt-1 font-mono-data"
+              value={form.document_number}
+              onChange={(e) => setForm((f) => ({ ...f, document_number: e.target.value }))}
+            />
+          </label>
+          <label className="block">
+            <span className="text-xs text-[var(--color-ink-soft)]">Дата<OcrConfidence doc={doc} field="invoice_date" /></span>
             <input
               type="date"
               className="input mt-1"
@@ -444,7 +477,7 @@ export default function DocumentDetail() {
         </div>
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Сумма, ₸</span>
+            <span className="text-xs text-[var(--color-ink-soft)]">Сумма, ₸<OcrConfidence doc={doc} field="total_amount" /></span>
             <input
               type="number"
               className="input mt-1 font-mono-data"
@@ -453,7 +486,7 @@ export default function DocumentDetail() {
             />
           </label>
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">НДС, ₸</span>
+            <span className="text-xs text-[var(--color-ink-soft)]">НДС, ₸<OcrConfidence doc={doc} field="vat_amount" /></span>
             <input
               type="number"
               className="input mt-1 font-mono-data"
@@ -477,13 +510,24 @@ export default function DocumentDetail() {
       <div className="mt-2 space-y-2">
         {items.map((item, i) => (
           <div key={i} className="rounded-xl border border-[var(--color-line)] bg-[var(--color-paper-raised)] p-3">
+            {item.confidence != null && (
+              <p className={item.needsReview ? 'mb-1 text-xs text-[var(--color-danger)]' : 'mb-1 text-xs text-[var(--color-ok)]'}>
+                {item.needsReview ? '⚠ Низкая уверенность OCR — проверьте строку' : `OCR: ${Math.round(item.confidence * 100)}%`}
+              </p>
+            )}
             <input
               className="input"
               placeholder="Наименование"
               value={item.name}
               onChange={(e) => updateItem(i, { name: e.target.value })}
             />
-            <div className="mt-2 grid grid-cols-4 gap-2">
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              <input
+                className="input"
+                placeholder="Артикул"
+                value={item.article ?? ''}
+                onChange={(e) => updateItem(i, { article: e.target.value })}
+              />
               <input
                 type="number"
                 className="input font-mono-data"

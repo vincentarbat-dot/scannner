@@ -18,6 +18,7 @@ export type UploadStatus = 'pending_upload' | 'uploading' | 'uploaded' | 'upload
 
 export interface RecognizedItem {
   name: string
+  article?: string
   quantity?: number
   unit?: string
   price?: number
@@ -30,12 +31,16 @@ export interface InvoiceDocument {
   supplier_id: string | null
   supplier_name: string | null
   supplier_bin: string | null
+  supplier_iin: string | null
+  document_number: string | null
   invoice_number: string | null
   invoice_date: string | null
   total_amount: number | null
   vat_amount: number | null
   bank_details: Record<string, unknown> | null
   recognized_items: RecognizedItem[] | null
+  ocr_result: Record<string, unknown> | null
+  ocr_completed_at: string | null
   status: DocumentStatus
   page_count: number
   quality_score: number | null
