@@ -6,7 +6,7 @@ import { supabase } from '../lib/supabase'
 import { useCamera } from '../hooks/useCamera'
 import { useFrameAnalysis } from '../hooks/useFrameAnalysis'
 import { ANALYSIS_WIDTH, analyzeFrame, pickHint, scorePage } from '../lib/imageQuality'
-import { saveScannedDocument, type SaveProgress } from '../lib/uploadDocument'
+import { saveScannedDocument, SaveDocumentError, type SaveProgress } from '../lib/uploadDocument'
 import { enqueueScan } from '../lib/offlineQueue'
 import CameraView from '../components/scan/CameraView'
 import PageManager from '../components/scan/PageManager'
@@ -37,8 +37,8 @@ const STEP_LABELS: Record<SaveProgress['step'], string> = {
   creating: 'Создаём документ…',
   processing: 'Обрабатываем страницы…',
   codes: 'Проверяем QR-коды и штрихкоды…',
-  ocr: 'Распознаём текст накладной…',
   uploading: 'Загружаем в облако…',
+  ocr: 'Распознаём текст (OCR)…',
   pdf: 'Формируем PDF…',
   finalizing: 'Завершаем сохранение…',
 }
@@ -56,6 +56,10 @@ export default function Scan() {
   const [progress, setProgress] = useState<SaveProgress | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [savedDocId, setSavedDocId] = useState<string | null>(null)
+  // Баг-фикс: id документа-черновика, уже созданного при неудачной
+  // попытке сохранения — переиспользуется при нажатии «Повторить», чтобы
+  // не плодить дубликаты накладной (см. SaveDocumentError, uploadDocument.ts).
+  const [pendingDocId, setPendingDocId] = useState<string | null>(null)
 
   const { videoRef, ready, error, facingMode, toggleFacing } = useCamera()
   const cameraActive = mode === 'camera' && !error
@@ -223,22 +227,30 @@ export default function Scan() {
     setMode('saving')
     setSaveError(null)
     try {
-      const { documentId } = await saveScannedDocument(pages, session.user.id, setProgress)
+      const { documentId } = await saveScannedDocument(
+        pages,
+        session.user.id,
+        setProgress,
+        pendingDocId ?? undefined
+      )
       setSavedDocId(documentId)
+      setPendingDocId(null)
       setMode('done')
     } catch (err) {
+      const draftDocumentId = err instanceof SaveDocumentError ? err.documentId : pendingDocId
+      if (draftDocumentId) setPendingDocId(draftDocumentId)
       if (isLikelyNetworkError(err)) {
         // Раздел 23 ТЗ: сохраняем локально и уходим на "готово" — фактическая
         // загрузка произойдёт автоматически при восстановлении сети
         // (OfflineSyncManager) либо вручную из панели очереди.
-        await enqueueScan(pages, session.user.id)
+        await enqueueScan(pages, session.user.id, draftDocumentId ?? undefined)
         setMode('queued')
         return
       }
       setSaveError(err instanceof Error ? err.message : 'Не удалось сохранить документ')
       setMode('error')
     }
-  }, [pages, session])
+  }, [pages, session, pendingDocId])
 
   if (mode === 'manage') {
     return (
@@ -337,8 +349,9 @@ export default function Scan() {
         </div>
         <h1 className="font-display text-2xl text-[var(--color-ink)]">Накладная сохранена</h1>
         <p className="text-sm text-[var(--color-ink-soft)]">
-          {pages.length} стр. обработано, загружено и собрано в PDF. Автоматическое распознавание
-          полей (OCR) появится в Части 5 — сейчас поля заполняются вручную в карточке документа.
+          {pages.length} стр. обработано, загружено и собрано в PDF. Поля документа распознаны
+          автоматически (OCR) — проверьте их в карточке документа и поправьте вручную, если
+          что-то распозналось неточно.
         </p>
         {savedDocId && (
           <button
@@ -363,6 +376,20 @@ export default function Scan() {
   // mode === 'camera'
   return (
     <div className="fixed inset-0 z-40 bg-black">
+      {/* Баг-фикс: чёрный экран/полосы при повороте (см. PROGRESS.md).
+          Показывается вместо живого превью в ландшафтной ориентации —
+          пытаться безопасно отрисовать getUserMedia-видео сразу после
+          поворота на телефонах ненадёжно, поэтому проще не показывать
+          его вовсе, пока пользователь не повернёт телефон обратно. */}
+      <div className="landscape-guard fixed inset-0 z-50 flex-col items-center justify-center gap-3 bg-black px-6 text-center text-white">
+        <span className="text-4xl" aria-hidden>
+          📱
+        </span>
+        <p className="text-sm">
+          Поверните телефон вертикально — камера сканера работает только в портретной ориентации.
+        </p>
+      </div>
+
       <input
         ref={fileInputRef}
         type="file"

@@ -11,7 +11,7 @@
 // OfflineQueuePanel.tsx.
 
 import { openDB, type IDBPDatabase } from 'idb'
-import { saveScannedDocument } from './uploadDocument'
+import { saveScannedDocument, SaveDocumentError } from './uploadDocument'
 import type { CapturedPage } from '../components/scan/types'
 
 export type QueueStatus = 'pending' | 'uploading' | 'uploaded' | 'error'
@@ -24,6 +24,10 @@ export interface QueueItem {
   error: string | null
   createdAt: number
   documentId?: string
+  /** Баг-фикс: id документа-черновика, уже созданного при неудачной
+   *  попытке — переиспользуется при повторе (см. SaveDocumentError в
+   *  uploadDocument.ts), чтобы retry не плодил дубликаты накладных. */
+  draftDocumentId?: string
 }
 
 const DB_NAME = 'invoice-scanner-offline'
@@ -54,7 +58,7 @@ export function onQueueChanged(listener: () => void): () => void {
   return () => window.removeEventListener(EVENT_NAME, listener)
 }
 
-export async function enqueueScan(pages: CapturedPage[], userId: string): Promise<QueueItem> {
+export async function enqueueScan(pages: CapturedPage[], userId: string, draftDocumentId?: string): Promise<QueueItem> {
   const db = await getDb()
   const item: QueueItem = {
     id: crypto.randomUUID(),
@@ -63,6 +67,7 @@ export async function enqueueScan(pages: CapturedPage[], userId: string): Promis
     status: 'pending',
     error: null,
     createdAt: Date.now(),
+    draftDocumentId,
   }
   await db.put(STORE, item)
   notifyChanged()
@@ -104,12 +109,17 @@ export async function processQueue(userId: string): Promise<void> {
       if (!navigator.onLine) break
       await updateItem(item.id, { status: 'uploading', error: null })
       try {
-        const { documentId } = await saveScannedDocument(item.pages, userId)
+        const { documentId } = await saveScannedDocument(item.pages, userId, undefined, item.draftDocumentId)
         await updateItem(item.id, { status: 'uploaded', documentId })
       } catch (err) {
+        // Баг-фикс: сохраняем draftDocumentId из исключения, чтобы
+        // СЛЕДУЮЩИЙ повтор переиспользовал этот же документ, а не создал
+        // ещё один — см. SaveDocumentError в uploadDocument.ts.
+        const draftDocumentId = err instanceof SaveDocumentError ? err.documentId : item.draftDocumentId
         await updateItem(item.id, {
           status: 'error',
           error: err instanceof Error ? err.message : 'Не удалось загрузить документ',
+          draftDocumentId,
         })
       }
     }

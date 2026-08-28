@@ -19,6 +19,31 @@
     Referrer-Policy = "strict-origin-when-cross-origin"
     # Камера нужна на страницах сканирования
     Permissions-Policy = "camera=(self), microphone=()"
+    # Часть 5 (OCR, раздел 13 ТЗ): PaddleOCR.js (@paddleocr/paddleocr-js)
+    # может использовать многопоточный WASM для ускорения инференса в
+    # браузере — для этого нужен "cross-origin isolated" контекст
+    # (COOP+COEP). Без этих заголовков движок просто останется
+    # однопоточным (медленнее, но по-прежнему рабочим) — заголовки не
+    # обязательны для функциональности, только для производительности.
+    #
+    # COEP: "credentialless", а не более строгий "require-corp" — иначе
+    # сломались бы существующие <img src={подписанная ссылка Supabase
+    # Storage}> в карточке документа (DocumentDetail.tsx): Supabase
+    # Storage не отдаёт заголовок Cross-Origin-Resource-Policy, который
+    # require-corp обязательно требует от любого кросс-доменного ресурса.
+    # "credentialless" достаточно для получения crossOriginIsolated и не
+    # требует этого заголовка от Supabase (просто не шлёт credentials на
+    # сторонние ресурсы — а подписанные ссылки Storage передают доступ
+    # через сам URL, не через cookie, так что это ничего не ломает).
+    #
+    # Если после деплоя что-то из этого всё же сломается на реальном
+    # Netlify+Supabase (в песочнице сеть недоступна — прогнать
+    # `npm install && npm run build`, задеплоить и проверить открытие
+    # изображений в /documents/:id и сам /scan вручную не удалось) —
+    # самый безопасный откат: удалить эти два заголовка целиком, OCR
+    # продолжит работать однопоточно.
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "credentialless"
 
 [[headers]]
   for = "/assets/*"

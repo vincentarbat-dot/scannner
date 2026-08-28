@@ -21,8 +21,7 @@ import { detectCodes, dataUrlToCanvas, type CodeDetection } from './codes'
 import { scoreDocumentOverall } from './imageQuality'
 import { buildDocumentPdf } from './pdf'
 import { getAutoStatusSetting } from './settings'
-import { recognizeInvoice } from './ocr'
-import { parseInvoice } from './invoiceParser'
+import { runDocumentOcr } from './ocr'
 import type { CapturedPage } from '../components/scan/types'
 import type { DocumentStatus } from '../types'
 
@@ -45,6 +44,25 @@ export interface SaveResult {
   documentId: string
 }
 
+// Баг-фикс (см. PROGRESS.md): раньше повтор после неудачной попытки —
+// и в офлайн-очереди (offlineQueue.ts), и в кнопке «Повторить» на экране
+// ошибки (Scan.tsx) — вызывал saveScannedDocument() с нуля, а функция
+// всегда СОЗДАЁТ новый документ. В итоге первая неудачная попытка
+// оставляла висящий документ со статусом upload_error, а вторая, удачная,
+// создавала ВТОРОЙ, отдельный документ с теми же страницами — задвоение
+// в архиве. Решение: при ошибке saveScannedDocument бросает именно этот
+// класс исключения с id уже созданного документа, вызывающая сторона
+// сохраняет его и передаёт вторым разом как existingDocumentId — тогда
+// функция переиспользует запись вместо создания новой (см. ниже).
+export class SaveDocumentError extends Error {
+  documentId: string
+  constructor(message: string, documentId: string) {
+    super(message)
+    this.name = 'SaveDocumentError'
+    this.documentId = documentId
+  }
+}
+
 async function uploadBlob(bucket: string, path: string, blob: Blob) {
   const { error } = await supabase.storage.from(bucket).upload(path, blob, {
     contentType: blob.type || 'image/jpeg',
@@ -56,28 +74,44 @@ async function uploadBlob(bucket: string, path: string, blob: Blob) {
 export async function saveScannedDocument(
   pages: CapturedPage[],
   userId: string,
-  onProgress?: (progress: SaveProgress) => void
+  onProgress?: (progress: SaveProgress) => void,
+  existingDocumentId?: string
 ): Promise<SaveResult> {
   if (pages.length === 0) throw new Error('Нет страниц для сохранения')
 
   onProgress?.({ step: 'creating', pageCount: pages.length })
 
-  const { data: doc, error: createError } = await supabase
-    .from('documents')
-    .insert({
-      created_by: userId,
-      status: 'new',
-      page_count: pages.length,
-      upload_status: 'uploading',
-    })
-    .select('id')
-    .single()
+  let documentId: string
+  if (existingDocumentId) {
+    // Повтор после неудачной попытки — переиспользуем уже созданный
+    // документ вместо нового (см. комментарий у SaveDocumentError выше).
+    // Строки со страницами/кодами прошлой попытки могли остаться в любом
+    // промежуточном состоянии — сносим их и собираем заново с нуля.
+    documentId = existingDocumentId
+    await supabase.from('document_codes').delete().eq('document_id', documentId)
+    await supabase.from('document_pages').delete().eq('document_id', documentId)
+    const { error: resetError } = await supabase
+      .from('documents')
+      .update({ status: 'new', page_count: pages.length, upload_status: 'uploading' })
+      .eq('id', documentId)
+    if (resetError) throw new Error(resetError.message)
+  } else {
+    const { data: doc, error: createError } = await supabase
+      .from('documents')
+      .insert({
+        created_by: userId,
+        status: 'new',
+        page_count: pages.length,
+        upload_status: 'uploading',
+      })
+      .select('id')
+      .single()
 
-  if (createError || !doc) {
-    throw new Error(createError?.message ?? 'Не удалось создать документ')
+    if (createError || !doc) {
+      throw new Error(createError?.message ?? 'Не удалось создать документ')
+    }
+    documentId = doc.id as string
   }
-
-  const documentId = doc.id as string
 
   try {
     const pageScores: number[] = []
@@ -85,8 +119,6 @@ export async function saveScannedDocument(
     let hasBarcode = false
     let hasUnreadableCode = false
     const processedBlobs: Blob[] = []
-    const ocrPages: Array<Record<string, unknown>> = []
-    const parsedPages: ReturnType<typeof parseInvoice>[] = []
 
     for (let i = 0; i < pages.length; i++) {
       const page = pages[i]
@@ -153,22 +185,40 @@ export async function saveScannedDocument(
         )
       }
 
-      // Part 5: OCR runs on the already processed image. PaddleOCR.js uses
-      // its own Web Worker, so inference does not occupy the React/UI thread.
-      onProgress?.({ step: 'ocr', pageIndex: i, pageCount: pages.length })
-      const ocr = await recognizeInvoice(processed.blob)
-      const parsed = parseInvoice(ocr.items)
-      parsedPages.push(parsed)
-      ocrPages.push({
-        page_number: pageNumber,
-        items: ocr.items,
-        width: ocr.width,
-        height: ocr.height,
-        metrics: ocr.metrics,
-        raw_text: parsed.rawText,
-      })
-
       pageScores.push(page.score)
+    }
+
+    // Раздел 13 ТЗ (Часть 5) — OCR по ОБРАБОТАННЫМ страницам, сразу после
+    // сохранения. Намеренно обёрнуто в try/catch: если движок не смог
+    // отработать (модель не загрузилась, WASM недоступен на устройстве и
+    // т.п.), это не должно ломать сохранение самой накладной — поля
+    // просто останутся пустыми для ручного заполнения, как было до
+    // Части 5, плюс запись в document_events для видимости в /admin.
+    onProgress?.({ step: 'ocr', pageCount: pages.length })
+    let ocrFields: Awaited<ReturnType<typeof runDocumentOcr>>['fields'] | null = null
+    let ocrItems: Awaited<ReturnType<typeof runDocumentOcr>>['items'] = []
+    try {
+      const ocrResult = await runDocumentOcr(processedBlobs)
+      ocrFields = ocrResult.fields
+      ocrItems = ocrResult.items
+      await supabase.from('document_events').insert({
+        document_id: documentId,
+        user_id: userId,
+        event_type: ocrResult.engineError ? 'ocr_error' : 'ocr_completed',
+        meta: ocrResult.engineError
+          ? { message: ocrResult.engineError }
+          : {
+              fields_found: Object.values(ocrResult.fields).filter((v) => v !== null && v !== '').length,
+              items_found: ocrResult.items.length,
+            },
+      })
+    } catch (err) {
+      await supabase.from('document_events').insert({
+        document_id: documentId,
+        user_id: userId,
+        event_type: 'ocr_error',
+        meta: { message: err instanceof Error ? err.message : String(err) },
+      })
     }
 
     onProgress?.({ step: 'pdf', pageCount: pages.length })
@@ -177,27 +227,6 @@ export async function saveScannedDocument(
     await uploadBlob(BUCKETS.pdfs, pdfPath, pdfBlob)
 
     onProgress?.({ step: 'finalizing', pageCount: pages.length })
-    const mergedItems = parsedPages.flatMap((p) => p.items)
-    const best = <T,>(values: Array<{ value: T; confidence: number }>): { value: T; confidence: number } =>
-      values.filter((v) => v.value !== '' && v.value !== 0).sort((a, b) => b.confidence - a.confidence)[0] ?? { value: '' as T, confidence: 0 }
-    const supplier = best(parsedPages.map((p) => p.supplier_name))
-    const supplierBin = best(parsedPages.map((p) => p.supplier_bin))
-    const supplierIin = best(parsedPages.map((p) => p.supplier_iin))
-    const invoiceNumber = best(parsedPages.map((p) => p.invoice_number))
-    const invoiceDate = best(parsedPages.map((p) => p.invoice_date))
-    const documentNumber = best(parsedPages.map((p) => p.document_number))
-    const total = best(parsedPages.map((p) => p.total_amount))
-    const vat = best(parsedPages.map((p) => p.vat_amount))
-    const bank = best(parsedPages.map((p) => p.bank_details))
-    const ocrResult = {
-      version: 1,
-      engine: 'PaddleOCR.js',
-      ocr_version: 'PP-OCRv5',
-      pages: ocrPages,
-      parsed: { supplier_name: supplier, supplier_bin: supplierBin, supplier_iin: supplierIin, invoice_number: invoiceNumber, invoice_date: invoiceDate, document_number: documentNumber, bank_details: bank, total_amount: total, vat_amount: vat },
-      completed_at: new Date().toISOString(),
-    }
-
     const quality = scoreDocumentOverall({ pageScores, hasUnreadableCode })
 
     // Раздел 18 ТЗ: статус может меняться автоматически "в зависимости от
@@ -224,18 +253,24 @@ export async function saveScannedDocument(
         pdf_path: pdfPath,
         upload_status: 'uploaded',
         status,
-        supplier_name: supplier.value || null,
-        supplier_bin: supplierBin.value || null,
-        supplier_iin: supplierIin.value || null,
-        invoice_number: invoiceNumber.value || documentNumber.value || null,
-        document_number: documentNumber.value || null,
-        invoice_date: invoiceDate.value || null,
-        total_amount: total.value || null,
-        vat_amount: vat.value || null,
-        bank_details: Object.keys(bank.value ?? {}).length ? { raw: Object.values(bank.value).join('\n'), parsed: bank.value } : null,
-        recognized_items: mergedItems.length ? mergedItems : null,
-        ocr_result: ocrResult,
-        ocr_completed_at: ocrResult.completed_at,
+        // Раздел 13 ТЗ — автозаполнение результатом OCR, при этом
+        // возможность ручной правки сохраняется полностью (карточка
+        // документа как была редактируемой, так и осталась — см.
+        // DocumentDetail.tsx). Если поле не распозналось — оставляем
+        // null, как и раньше (до Части 5 все эти поля тоже были null
+        // сразу после сохранения).
+        ...(ocrFields
+          ? {
+              supplier_name: ocrFields.supplier_name,
+              supplier_bin: ocrFields.supplier_bin,
+              invoice_number: ocrFields.invoice_number,
+              invoice_date: ocrFields.invoice_date,
+              total_amount: ocrFields.total_amount,
+              vat_amount: ocrFields.vat_amount,
+              bank_details: ocrFields.bank_details ? { raw: ocrFields.bank_details } : null,
+            }
+          : {}),
+        ...(ocrItems.length > 0 ? { recognized_items: ocrItems } : {}),
       })
       .eq('id', documentId)
 
@@ -265,6 +300,9 @@ export async function saveScannedDocument(
       event_type: 'processing_error',
       meta: { message: err instanceof Error ? err.message : String(err) },
     })
-    throw err
+    // documentId сохраняется в исключении, чтобы повтор (Scan.tsx /
+    // offlineQueue.ts) переиспользовал этот же документ — см.
+    // SaveDocumentError выше.
+    throw new SaveDocumentError(err instanceof Error ? err.message : String(err), documentId)
   }
 }

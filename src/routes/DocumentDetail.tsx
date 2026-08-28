@@ -1,15 +1,22 @@
 // Карточка накладной — раздел 15 ТЗ, Часть 3.
 //
-// Часть 5: OCR заполняет эту же форму; ручное исправление пользователя является источником истины.
-
+// OCR (раздел 13, Часть 5) подключён через src/lib/ocr — при первом
+// сохранении накладной (Scan.tsx → uploadDocument.ts) поля заполняются
+// автоматически. Кнопка «Распознать текст (OCR)» ниже даёт то же самое
+// для уже загруженных ранее документов (снятых до Части 5, либо если
+// движок не смог отработать при сохранении — см. document_events).
+// Форма остаётся полностью редактируемой в любом случае — раздел 13
+// прямо требует возможность ручной коррекции распознанных данных.
 
 import { useCallback, useEffect, useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 import { getSignedUrl } from '../lib/storage'
-import { reprocessPage, DEFAULT_REPROCESS_OPTIONS, type ReprocessOptions } from '../lib/reprocess'
+import { reprocessPage, finalizeReprocessedDocument, DEFAULT_REPROCESS_OPTIONS, type ReprocessOptions } from '../lib/reprocess'
+import type { CodeDetection } from '../lib/codes'
 import type { ProcessingMode } from '../lib/imageProcessing'
+import { runDocumentOcr } from '../lib/ocr'
 import {
   STATUS_LABELS,
   CODE_TYPE_LABELS,
@@ -25,15 +32,13 @@ interface PageWithUrls extends DocumentPage {
   processedUrl: string | null
 }
 
-const STATUS_OPTIONS: DocumentStatus[] = ['new', 'reviewed', 'sent_to_accounting', 'processed', 'archived']
-
-function OcrConfidence({ doc, field }: { doc: InvoiceDocument; field: string }) {
-  const parsed = doc.ocr_result && typeof doc.ocr_result === 'object' ? (doc.ocr_result as { parsed?: Record<string, { confidence?: number; needsReview?: boolean }> }).parsed : undefined
-  const confidence = parsed?.[field]?.confidence
-  if (confidence == null) return null
-  const low = parsed?.[field]?.needsReview || confidence < 0.75
-  return <span className={low ? 'ml-2 text-xs text-[var(--color-danger)]' : 'ml-2 text-xs text-[var(--color-ok)]'}>{low ? '⚠ проверить OCR' : `OCR ${Math.round(confidence * 100)}%`}</span>
+// Баг-фикс: раздел 15 ТЗ требует показывать «сотрудника» в карточке
+// документа — раньше поле нигде не читалось и не отображалось.
+interface DocWithEmployee extends InvoiceDocument {
+  profiles?: { full_name: string | null } | null
 }
+
+const STATUS_OPTIONS: DocumentStatus[] = ['new', 'reviewed', 'sent_to_accounting', 'processed', 'archived']
 
 function emptyItem(): RecognizedItem {
   return { name: '', quantity: undefined, unit: '', price: undefined, amount: undefined }
@@ -44,11 +49,14 @@ export default function DocumentDetail() {
   const navigate = useNavigate()
   const { session } = useAuth()
 
-  const [doc, setDoc] = useState<InvoiceDocument | null>(null)
+  const [doc, setDoc] = useState<DocWithEmployee | null>(null)
   const [reprocessOptions, setReprocessOptions] = useState<ReprocessOptions>(DEFAULT_REPROCESS_OPTIONS)
   const [reprocessing, setReprocessing] = useState(false)
   const [reprocessError, setReprocessError] = useState<string | null>(null)
   const [reprocessDone, setReprocessDone] = useState(false)
+  const [ocrRunning, setOcrRunning] = useState(false)
+  const [ocrError, setOcrError] = useState<string | null>(null)
+  const [ocrNotice, setOcrNotice] = useState<string | null>(null)
   const [pages, setPages] = useState<PageWithUrls[]>([])
   const [codes, setCodes] = useState<DocumentCode[]>([])
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
@@ -61,9 +69,7 @@ export default function DocumentDetail() {
   const [form, setForm] = useState({
     supplier_name: '',
     supplier_bin: '',
-    supplier_iin: '',
     invoice_number: '',
-    document_number: '',
     invoice_date: '',
     total_amount: '',
     vat_amount: '',
@@ -78,7 +84,7 @@ export default function DocumentDetail() {
 
     const { data: docData, error: docError } = await supabase
       .from('documents')
-      .select('*')
+      .select('*, profiles(full_name)')
       .eq('id', id)
       .single()
 
@@ -88,14 +94,12 @@ export default function DocumentDetail() {
       return
     }
 
-    const document = docData as InvoiceDocument
+    const document = docData as DocWithEmployee
     setDoc(document)
     setForm({
       supplier_name: document.supplier_name ?? '',
       supplier_bin: document.supplier_bin ?? '',
-      supplier_iin: document.supplier_iin ?? '',
       invoice_number: document.invoice_number ?? '',
-      document_number: document.document_number ?? '',
       invoice_date: document.invoice_date ?? '',
       total_amount: document.total_amount != null ? String(document.total_amount) : '',
       vat_amount: document.vat_amount != null ? String(document.vat_amount) : '',
@@ -145,9 +149,7 @@ export default function DocumentDetail() {
       .update({
         supplier_name: form.supplier_name || null,
         supplier_bin: form.supplier_bin || null,
-        supplier_iin: form.supplier_iin || null,
         invoice_number: form.invoice_number || null,
-        document_number: form.document_number || null,
         invoice_date: form.invoice_date || null,
         total_amount: form.total_amount ? Number(form.total_amount) : null,
         vat_amount: form.vat_amount ? Number(form.vat_amount) : null,
@@ -171,12 +173,13 @@ export default function DocumentDetail() {
       await supabase.from('documents').update({ status }).eq('id', id)
       await supabase.from('document_events').insert({
         document_id: id,
+        user_id: session?.user?.id ?? null,
         event_type: 'status_change',
         meta: { status },
       })
       load()
     },
-    [id, load]
+    [id, session, load]
   )
 
   const handleReprocess = useCallback(async () => {
@@ -185,9 +188,15 @@ export default function DocumentDetail() {
     setReprocessError(null)
     setReprocessDone(false)
     try {
+      const results: Array<{ pageId: string; blob: Blob; codes: CodeDetection[] }> = []
       for (const page of pages) {
-        await reprocessPage(id, session.user.id, page, reprocessOptions)
+        const r = await reprocessPage(id, session.user.id, page, reprocessOptions)
+        results.push(r)
       }
+      // Баг-фикс: раньше здесь заканчивалось — коды/качество/PDF
+      // оставались от самой первой обработки при сохранении (раздел 8,
+      // 20 ТЗ). Теперь пересобираем их одним разом по всем страницам.
+      await finalizeReprocessedDocument(id, session.user.id, results)
       setReprocessDone(true)
       window.setTimeout(() => setReprocessDone(false), 2500)
       await load()
@@ -197,6 +206,71 @@ export default function DocumentDetail() {
       setReprocessing(false)
     }
   }, [id, session, pages, reprocessOptions, load])
+
+  // Раздел 13 ТЗ, Часть 5 — повторный/ручной запуск OCR для уже
+  // загруженной накладной. Берём УЖЕ ОБРАБОТАННЫЕ страницы (те же файлы,
+  // что показаны как «Улучшенный» ниже) по подписанным ссылкам — оригинал
+  // в OCR не участвует, соответствует тому же правилу, что и при
+  // автоматическом OCR на сохранении.
+  //
+  // ВНИМАНИЕ: найденные поля подставляются в форму (перезаписывая то, что
+  // было — как и любая другая правка формы), но не сохраняются в БД сами
+  // по себе — требуют нажатия «Сохранить изменения» ниже, так что
+  // случайно потерять уже сохранённые данные нельзя, пока не подтвердишь.
+  const handleRunOcr = useCallback(async () => {
+    if (!id || pages.length === 0) return
+    const pagesToScan = pages.filter((p) => p.processedUrl)
+    if (pagesToScan.length === 0) {
+      setOcrError('Нет обработанных страниц для распознавания')
+      return
+    }
+    setOcrRunning(true)
+    setOcrError(null)
+    setOcrNotice(null)
+    try {
+      const blobs = await Promise.all(
+        pagesToScan.map(async (p) => {
+          const res = await fetch(p.processedUrl as string)
+          if (!res.ok) throw new Error('Не удалось загрузить страницу для распознавания')
+          return res.blob()
+        })
+      )
+      const result = await runDocumentOcr(blobs)
+      if (result.engineError) {
+        setOcrError(`OCR не смог отработать: ${result.engineError}`)
+      } else {
+        const foundCount = Object.values(result.fields).filter((v) => v !== null && v !== '').length
+        setOcrNotice(
+          foundCount > 0 || result.items.length > 0
+            ? `Распознано полей: ${foundCount}, товаров: ${result.items.length}. Проверьте и сохраните изменения.`
+            : 'Не удалось распознать поля на этих страницах — заполните вручную.'
+        )
+      }
+      setForm((f) => ({
+        supplier_name: result.fields.supplier_name ?? f.supplier_name,
+        supplier_bin: result.fields.supplier_bin ?? f.supplier_bin,
+        invoice_number: result.fields.invoice_number ?? f.invoice_number,
+        invoice_date: result.fields.invoice_date ?? f.invoice_date,
+        total_amount: result.fields.total_amount != null ? String(result.fields.total_amount) : f.total_amount,
+        vat_amount: result.fields.vat_amount != null ? String(result.fields.vat_amount) : f.vat_amount,
+        bank_details: result.fields.bank_details ?? f.bank_details,
+      }))
+      if (result.items.length > 0) setItems(result.items)
+
+      await supabase.from('document_events').insert({
+        document_id: id,
+        user_id: session?.user?.id ?? null,
+        event_type: result.engineError ? 'ocr_error' : 'ocr_rerun',
+        meta: result.engineError
+          ? { message: result.engineError }
+          : { fields_found: Object.values(result.fields).filter((v) => v !== null && v !== '').length },
+      })
+    } catch (err) {
+      setOcrError(err instanceof Error ? err.message : 'Не удалось распознать текст')
+    } finally {
+      setOcrRunning(false)
+    }
+  }, [id, pages, session])
 
   const updateItem = (index: number, patch: Partial<RecognizedItem>) => {
     setItems((prev) => prev.map((it, i) => (i === index ? { ...it, ...patch } : it)))
@@ -254,6 +328,7 @@ export default function DocumentDetail() {
           Качество: {doc.quality_score != null ? `${doc.quality_score}%` : '—'}
         </span>
         <span>Загружено: {new Date(doc.created_at).toLocaleString('ru-RU')}</span>
+        <span>Сотрудник: {doc.profiles?.full_name || 'неизвестен'}</span>
         {doc.upload_status === 'upload_error' && (
           <span className="text-[var(--color-danger)]">Ошибка загрузки</span>
         )}
@@ -284,13 +359,6 @@ export default function DocumentDetail() {
       </div>
 
       {/* Раздел 20 ТЗ: два варианта каждой страницы */}
-      {doc.ocr_result && (
-        <div className="mt-4 rounded-xl border border-[var(--color-line)] bg-[var(--color-paper-raised)] p-3">
-          <p className="text-sm font-medium text-[var(--color-ink)]">OCR: PaddleOCR.js · PP-OCRv5</p>
-          <p className="mt-1 text-xs text-[var(--color-ink-soft)]">Результат сохранён для проверки. Значения с низкой уверенностью отмечены ⚠.</p>
-        </div>
-      )}
-
       <h2 className="font-display mt-6 text-lg text-[var(--color-ink)]">Страницы</h2>
       <div className="mt-2 space-y-3">
         {pages.map((p) => (
@@ -420,12 +488,24 @@ export default function DocumentDetail() {
       {/* Раздел 13, 15 ТЗ: распознанные / вводимые вручную поля */}
       <h2 className="font-display mt-6 text-lg text-[var(--color-ink)]">Данные накладной</h2>
       <p className="mt-1 text-xs text-[var(--color-ink-soft)]">
-        PaddleOCR автоматически заполняет поля. Проверьте значения с ⚠ перед сохранением — ручная правка пользователя имеет приоритет.
+        Поля распознаются автоматически (OCR) при сохранении. Проверьте их и поправьте вручную,
+        если что-то распозналось неточно.
       </p>
+
+      <button
+        type="button"
+        onClick={handleRunOcr}
+        disabled={ocrRunning || pages.length === 0}
+        className="mt-3 w-full rounded-xl border border-[var(--color-line)] bg-[var(--color-paper-raised)] py-2.5 text-sm font-medium text-[var(--color-accent)] disabled:opacity-50"
+      >
+        {ocrRunning ? 'Распознаём текст…' : 'Распознать текст (OCR) заново'}
+      </button>
+      {ocrError && <p className="mt-1.5 text-xs text-[var(--color-danger)]">{ocrError}</p>}
+      {ocrNotice && !ocrError && <p className="mt-1.5 text-xs text-[var(--color-ok)]">{ocrNotice}</p>}
 
       <div className="mt-3 space-y-3">
         <label className="block">
-          <span className="text-xs text-[var(--color-ink-soft)]">Поставщик<OcrConfidence doc={doc} field="supplier_name" /></span>
+          <span className="text-xs text-[var(--color-ink-soft)]">Поставщик</span>
           <input
             className="input mt-1"
             value={form.supplier_name}
@@ -433,24 +513,16 @@ export default function DocumentDetail() {
           />
         </label>
         <label className="block">
-          <span className="text-xs text-[var(--color-ink-soft)]">БИН<OcrConfidence doc={doc} field="supplier_bin" /></span>
+          <span className="text-xs text-[var(--color-ink-soft)]">БИН</span>
           <input
             className="input mt-1 font-mono-data"
             value={form.supplier_bin}
             onChange={(e) => setForm((f) => ({ ...f, supplier_bin: e.target.value }))}
           />
         </label>
-        <label className="block">
-          <span className="text-xs text-[var(--color-ink-soft)]">ИИН<OcrConfidence doc={doc} field="supplier_iin" /></span>
-          <input
-            className="input mt-1 font-mono-data"
-            value={form.supplier_iin}
-            onChange={(e) => setForm((f) => ({ ...f, supplier_iin: e.target.value }))}
-          />
-        </label>
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Номер накладной<OcrConfidence doc={doc} field="invoice_number" /></span>
+            <span className="text-xs text-[var(--color-ink-soft)]">Номер накладной</span>
             <input
               className="input mt-1 font-mono-data"
               value={form.invoice_number}
@@ -458,15 +530,7 @@ export default function DocumentDetail() {
             />
           </label>
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Номер документа<OcrConfidence doc={doc} field="document_number" /></span>
-            <input
-              className="input mt-1 font-mono-data"
-              value={form.document_number}
-              onChange={(e) => setForm((f) => ({ ...f, document_number: e.target.value }))}
-            />
-          </label>
-          <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Дата<OcrConfidence doc={doc} field="invoice_date" /></span>
+            <span className="text-xs text-[var(--color-ink-soft)]">Дата</span>
             <input
               type="date"
               className="input mt-1"
@@ -477,7 +541,7 @@ export default function DocumentDetail() {
         </div>
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">Сумма, ₸<OcrConfidence doc={doc} field="total_amount" /></span>
+            <span className="text-xs text-[var(--color-ink-soft)]">Сумма, ₸</span>
             <input
               type="number"
               className="input mt-1 font-mono-data"
@@ -486,7 +550,7 @@ export default function DocumentDetail() {
             />
           </label>
           <label className="block">
-            <span className="text-xs text-[var(--color-ink-soft)]">НДС, ₸<OcrConfidence doc={doc} field="vat_amount" /></span>
+            <span className="text-xs text-[var(--color-ink-soft)]">НДС, ₸</span>
             <input
               type="number"
               className="input mt-1 font-mono-data"
@@ -510,24 +574,13 @@ export default function DocumentDetail() {
       <div className="mt-2 space-y-2">
         {items.map((item, i) => (
           <div key={i} className="rounded-xl border border-[var(--color-line)] bg-[var(--color-paper-raised)] p-3">
-            {item.confidence != null && (
-              <p className={item.needsReview ? 'mb-1 text-xs text-[var(--color-danger)]' : 'mb-1 text-xs text-[var(--color-ok)]'}>
-                {item.needsReview ? '⚠ Низкая уверенность OCR — проверьте строку' : `OCR: ${Math.round(item.confidence * 100)}%`}
-              </p>
-            )}
             <input
               className="input"
               placeholder="Наименование"
               value={item.name}
               onChange={(e) => updateItem(i, { name: e.target.value })}
             />
-            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
-              <input
-                className="input"
-                placeholder="Артикул"
-                value={item.article ?? ''}
-                onChange={(e) => updateItem(i, { article: e.target.value })}
-              />
+            <div className="mt-2 grid grid-cols-4 gap-2">
               <input
                 type="number"
                 className="input font-mono-data"

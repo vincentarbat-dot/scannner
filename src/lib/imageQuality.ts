@@ -254,6 +254,22 @@ export function scoreDocumentOverall(input: DocumentQualityInput): PageQuality {
   return { score: Math.max(0, Math.min(100, Math.round(score))), warnings }
 }
 
+// Баг-фикс (см. PROGRESS.md): «Улучшить документ» (раздел 21 ТЗ) раньше
+// не пересчитывал резкость/блики после повторной обработки — is_blurry/
+// has_glare оставались от самой первой обработки при сохранении, даже
+// если пользователь явно менял режим/резкость. Лёгкая версия scorePage()
+// без учёта bounds (страница уже обрезана, границы заново не ищем) —
+// используется в reprocess.ts на готовом обработанном изображении.
+export function assessProcessedImage(imageData: ImageData): { isBlurry: boolean; hasGlare: boolean } {
+  const { data: gray, width, height } = toGrayscale(imageData)
+  const sharpness = laplacianVariance(gray, width, height)
+  const glareRatio = computeGlareRatio(gray)
+  return {
+    isBlurry: sharpness < THRESHOLDS.sharpnessOk,
+    hasGlare: glareRatio > THRESHOLDS.glareMax,
+  }
+}
+
 export function scorePage(m: FrameMetrics): PageQuality {
   const warnings: string[] = []
   let score = 100

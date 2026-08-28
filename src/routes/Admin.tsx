@@ -22,9 +22,22 @@ interface ProcessingError {
 }
 
 export default function Admin() {
-  const { profile } = useAuth()
+  const { profile, loading } = useAuth()
 
-  if (profile && profile.role !== 'admin') {
+  // Баг-фикс: раньше проверка была `profile && profile.role !== 'admin'` —
+  // если профиль ещё не загрузился ИЛИ не загрузился вовсе (null),
+  // условие ложно и компонент проваливался в <AdminPanel/> по умолчанию.
+  // RLS на бэкенде данные не отдаст, но сам UI-гейт должен быть закрыт по
+  // умолчанию, а не открыт — раздел 24-25 ТЗ (разграничение доступа).
+  if (loading) {
+    return (
+      <div className="mx-auto max-w-md px-5 pb-28 pt-8">
+        <p className="text-sm text-[var(--color-ink-soft)]">Загрузка…</p>
+      </div>
+    )
+  }
+
+  if (!profile || profile.role !== 'admin') {
     return (
       <div className="mx-auto max-w-md px-5 pb-28 pt-8">
         <h1 className="font-display text-2xl text-[var(--color-ink)]">Панель администратора</h1>
@@ -39,6 +52,7 @@ export default function Admin() {
 }
 
 function AdminPanel() {
+  const { session } = useAuth()
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null)
   const [docs, setDocs] = useState<InvoiceDocument[]>([])
   const [docFilter, setDocFilter] = useState('')
@@ -82,7 +96,9 @@ function AdminPanel() {
 
   const handleStatusChange = async (docId: string, status: DocumentStatus) => {
     await supabase.from('documents').update({ status }).eq('id', docId)
-    await supabase.from('document_events').insert({ document_id: docId, event_type: 'status_change', meta: { status, by: 'admin' } })
+    await supabase
+      .from('document_events')
+      .insert({ document_id: docId, user_id: session?.user?.id ?? null, event_type: 'status_change', meta: { status, by: 'admin' } })
     loadDocs(docFilter)
   }
 

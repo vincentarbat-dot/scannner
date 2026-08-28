@@ -11,318 +11,103 @@ export interface UseCameraResult {
   toggleFacing: () => void
 }
 
-/**
- * Камера через getUserMedia.
- *
- * Некоторые мобильные браузеры принимают слишком агрессивные constraints
- * (особенно 4096x2160 + facingMode) и возвращают поток, у которого video
- * остаётся чёрным. Поэтому запускаем камеру каскадом: сначала просим
- * подходящую камеру и высокое разрешение, затем постепенно упрощаем
- * constraints.
- */
+// Доступ к камере через браузер, максимальное доступное разрешение,
+// по умолчанию — тыловая камера (раздел 3 ТЗ).
 export function useCamera(): UseCameraResult {
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const startIdRef = useRef(0)
-
   const [ready, setReady] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [facingMode, setFacingMode] =
-    useState<'environment' | 'user'>('environment')
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment')
+  // Баг-фикс: чёрный экран/полосы при повороте телефона (см. PROGRESS.md).
+  // Помимо CSS-заглушки на /scan (index.css .landscape-guard), здесь —
+  // пересоздание MediaStream при повороте: некоторые Android-браузеры
+  // оставляют видео-поток в "битом" состоянии после смены ориентации,
+  // и единственный надёжный способ вернуть чистую картинку — открыть
+  // поток заново, а не пытаться починить уже идущий.
+  const [restartToken, setRestartToken] = useState(0)
 
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
+  }, [])
 
-    const video = videoRef.current
-
-    if (video) {
-      video.pause()
-      video.srcObject = null
+  useEffect(() => {
+    const handleOrientationChange = () => {
+      // Небольшая задержка: события ориентации на части устройств
+      // приходят до того, как браузер закончил перекомпоновку layout —
+      // пересоздаём поток уже после того, как всё устаканилось.
+      window.setTimeout(() => setRestartToken((t) => t + 1), 300)
     }
+    window.addEventListener('orientationchange', handleOrientationChange)
+    return () => window.removeEventListener('orientationchange', handleOrientationChange)
   }, [])
 
   useEffect(() => {
     let cancelled = false
-    const startId = ++startIdRef.current
-
     setReady(false)
     setError(null)
-
-    async function waitForVideo(
-      video: HTMLVideoElement,
-      stream: MediaStream,
-    ): Promise<void> {
-      video.srcObject = stream
-      video.muted = true
-      video.autoplay = true
-      video.playsInline = true
-
-      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-        await new Promise<void>((resolve) => {
-          const onLoaded = () => {
-            video.removeEventListener('loadedmetadata', onLoaded)
-            resolve()
-          }
-
-          video.addEventListener('loadedmetadata', onLoaded, {
-            once: true,
-          })
-
-          window.setTimeout(() => {
-            video.removeEventListener('loadedmetadata', onLoaded)
-            resolve()
-          }, 2000)
-        })
-      }
-
-      try {
-        await video.play()
-      } catch {
-        // muted + playsInline обычно позволяют autoplay.
-      }
-
-      // Даём камере время начать отдавать реальные кадры.
-      const deadline = performance.now() + 2500
-
-      const probe = document.createElement('canvas')
-      probe.width = 16
-      probe.height = 12
-
-      const probeContext = probe.getContext('2d', {
-        willReadFrequently: true,
-      })
-
-      while (!cancelled && performance.now() < deadline) {
-        if (
-          video.videoWidth > 0 &&
-          video.videoHeight > 0 &&
-          video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
-        ) {
-          if (probeContext) {
-            probeContext.drawImage(
-              video,
-              0,
-              0,
-              probe.width,
-              probe.height,
-            )
-
-            const pixels = probeContext.getImageData(
-              0,
-              0,
-              probe.width,
-              probe.height,
-            ).data
-
-            let nonBlack = 0
-
-            for (let i = 0; i < pixels.length; i += 4) {
-              if (
-                pixels[i] > 8 ||
-                pixels[i + 1] > 8 ||
-                pixels[i + 2] > 8
-              ) {
-                nonBlack++
-              }
-            }
-
-            if (nonBlack > 2) {
-              return
-            }
-          } else {
-            return
-          }
-        }
-
-        await new Promise((resolve) =>
-          window.setTimeout(resolve, 100),
-        )
-      }
-
-      if (video.videoWidth === 0 || video.videoHeight === 0) {
-        throw new DOMException(
-          'Camera produced no video frames',
-          'NotReadableError',
-        )
-      }
-
-      // Камера вернула поток, но фактически отдаёт чёрное изображение.
-      throw new DOMException(
-        'Camera produced black video frames',
-        'NotReadableError',
-      )
-    }
 
     async function start() {
       if (!navigator.mediaDevices?.getUserMedia) {
         setError('Камера недоступна в этом браузере.')
         return
       }
-
       stopStream()
-
-      /*
-       * Используем каскад constraints.
-       *
-       * 1. Задняя/передняя камера + высокое разрешение.
-       * 2. Full HD.
-       * 3. Только facingMode.
-       * 4. Любая доступная камера.
-       *
-       * Это важно для устройств, где запрос 4K вызывает
-       * чёрный video stream.
-       */
-      const constraints: MediaStreamConstraints[] = [
-        {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
-            facingMode: {
-              exact: facingMode,
-            },
-            width: {
-              ideal: 4096,
-            },
-            height: {
-              ideal: 2160,
-            },
+            facingMode: { ideal: facingMode },
+            // Раньше здесь было 4096×2160 — нестандартное соотношение
+            // сторон (~17:9), которое не совпадает ни с одним типичным
+            // сенсором (4:3 или 16:9). На части телефонов это заставляло
+            // драйвер камеры подгонять/обрезать кадр, что усиливало
+            // артефакты при любой ренеготиации потока (в т.ч. при
+            // повороте экрана). 3840×2160 (честные 4K, 16:9) — разрешение
+            // максимально высокое, но соответствует реальным профилям
+            // камер, поэтому стабильнее (раздел 3 ТЗ: "максимально
+            // доступное разрешение", а не обязательно 4096 по ширине).
+            width: { ideal: 3840 },
+            height: { ideal: 2160 },
           },
-        },
-
-        {
-          audio: false,
-          video: {
-            facingMode: {
-              ideal: facingMode,
-            },
-            width: {
-              ideal: 1920,
-            },
-            height: {
-              ideal: 1080,
-            },
-          },
-        },
-
-        {
-          audio: false,
-          video: {
-            facingMode: {
-              ideal: facingMode,
-            },
-          },
-        },
-
-        {
-          audio: false,
-          video: true,
-        },
-      ]
-
-      let lastError: unknown = null
-
-      for (const mediaConstraints of constraints) {
-        if (
-          cancelled ||
-          startId !== startIdRef.current
-        ) {
+        })
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop())
           return
         }
-
-        let stream: MediaStream | null = null
-
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(
-            mediaConstraints,
-          )
-
-          if (
-            cancelled ||
-            startId !== startIdRef.current
-          ) {
-            stream.getTracks().forEach((track) => track.stop())
-            return
-          }
-
-          streamRef.current = stream
-
-          const video = videoRef.current
-
-          if (!video) {
-            throw new DOMException(
-              'Video element is unavailable',
-              'AbortError',
-            )
-          }
-
-          await waitForVideo(video, stream)
-
-          if (
-            cancelled ||
-            startId !== startIdRef.current
-          ) {
-            return
-          }
-
-          setReady(true)
-
-          return
-        } catch (e) {
-          lastError = e
-
-          stream?.getTracks().forEach((track) => track.stop())
-
-          streamRef.current = null
-
-          if (videoRef.current) {
-            videoRef.current.srcObject = null
-          }
+        streamRef.current = stream
+        const video = videoRef.current
+        if (video) {
+          video.srcObject = stream
+          await video.play().catch(() => {
+            // autoplay может быть заблокирован до жеста пользователя — не критично,
+            // элементы управления всё равно доступны после взаимодействия.
+          })
         }
-      }
-
-      if (
-        cancelled ||
-        startId !== startIdRef.current
-      ) {
-        return
-      }
-
-      const err = lastError as DOMException | undefined
-
-      if (
-        err?.name === 'NotAllowedError' ||
-        err?.name === 'SecurityError'
-      ) {
-        setError(
-          'Нет доступа к камере. Разрешите доступ в настройках браузера.',
-        )
-      } else if (err?.name === 'NotFoundError') {
-        setError('Камера не найдена на устройстве.')
-      } else if (err?.name === 'NotReadableError') {
-        setError(
-          'Камера найдена, но браузер не получает изображение. Закройте другие приложения, использующие камеру, и попробуйте ещё раз.',
-        )
-      } else {
-        setError(
-          'Не удалось запустить камеру. Попробуйте ещё раз.',
-        )
+        if (!cancelled) setReady(true)
+      } catch (e) {
+        if (cancelled) return
+        const err = e as DOMException
+        if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+          setError('Нет доступа к камере. Разрешите доступ в настройках браузера.')
+        } else if (err.name === 'NotFoundError' || err.name === 'OverconstrainedError') {
+          setError('Подходящая камера не найдена на устройстве.')
+        } else {
+          setError('Не удалось запустить камеру. Попробуйте ещё раз.')
+        }
       }
     }
 
-    void start()
-
+    start()
     return () => {
       cancelled = true
       stopStream()
     }
-  }, [facingMode, stopStream])
+  }, [facingMode, stopStream, restartToken])
 
   const toggleFacing = useCallback(() => {
-    setFacingMode((mode) =>
-      mode === 'environment'
-        ? 'user'
-        : 'environment',
-    )
+    setFacingMode((mode) => (mode === 'environment' ? 'user' : 'environment'))
   }, [])
 
   return {

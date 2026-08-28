@@ -34,7 +34,7 @@ export default function Settings() {
       </button>
 
       <p className="mt-8 text-center text-xs text-[var(--color-ink-soft)]">
-        Сканер накладных · MVP, Часть 4
+        Сканер накладных · MVP, Часть 5
       </p>
     </div>
   )
