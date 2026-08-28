@@ -13,8 +13,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 import { getSignedUrl } from '../lib/storage'
-import { reprocessPage, finalizeReprocessedDocument, DEFAULT_REPROCESS_OPTIONS, type ReprocessOptions } from '../lib/reprocess'
-import type { CodeDetection } from '../lib/codes'
+import { reprocessPage, finalizeReprocessedDocument, DEFAULT_REPROCESS_OPTIONS, type ReprocessOptions, type ReprocessPageResult } from '../lib/reprocess'
 import type { ProcessingMode } from '../lib/imageProcessing'
 import { runDocumentOcr } from '../lib/ocr'
 import {
@@ -188,7 +187,7 @@ export default function DocumentDetail() {
     setReprocessError(null)
     setReprocessDone(false)
     try {
-      const results: Array<{ pageId: string; blob: Blob; codes: CodeDetection[] }> = []
+      const results: ReprocessPageResult[] = []
       for (const page of pages) {
         const r = await reprocessPage(id, session.user.id, page, reprocessOptions)
         results.push(r)
